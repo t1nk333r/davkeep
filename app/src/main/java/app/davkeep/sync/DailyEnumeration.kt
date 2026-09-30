@@ -2,13 +2,14 @@ package app.davkeep.sync
 
 import android.accounts.Account
 import android.content.Context
+import app.davkeep.core.AccountStore
 import app.davkeep.core.DavAccount
 import app.davkeep.core.DavCollection
 import app.davkeep.core.DavHttpClientFactory
 import app.davkeep.core.SyncErrorClassifier
 import app.davkeep.ui.CollectionDiscovery
-import app.davkeep.ui.CollectionSelectionWriter
 import app.davkeep.ui.SyncLog
+import app.davkeep.ui.updateCollections
 
 /**
  * §8's re-enumeration, as the sync path reaches it: one walk of the Account's server, and the four
@@ -54,12 +55,19 @@ fun interface CollectionEnumerator {
  * off. What the merge does change is the vanished direction — a stored Collection the server no
  * longer lists is marked unavailable rather than deleted, and unavailable Collections are not
  * synced.
+ *
+ * The merge starts from the record as it is stored when the walk ends, not from the copy the run
+ * loaded before the walk began. Discovery spends seconds on the network, and the settings screens
+ * write the same record in that time: a `writable` switch turned off while the walk was out was
+ * turned back on by a merge over the run's snapshot, and the next run sent edits to a Collection
+ * the user had just declared read-only. [updateCollections] is the settings screens' own path for
+ * the same reason, and going through it here is what makes the two writers agree.
  */
 internal class DailyEnumeration(
     context: Context,
     private val factory: DavHttpClientFactory,
     private val classifier: SyncErrorClassifier,
-    private val writer: CollectionSelectionWriter,
+    private val store: AccountStore,
 ) : CollectionEnumerator {
 
     private val appContext = context.applicationContext
@@ -94,19 +102,23 @@ internal class DailyEnumeration(
         )
         if (!outcome.completed) return null
 
-        val merged = CollectionDiscovery.merge(davAccount.collections, outcome.collections)
         // The store, not the Account record: a walk rewrites the selection and nothing else, and
         // AccountStore.save is total — it would take the header names and the password this walk
         // never read as removals.
-        writer.saveCollections(account, merged)
+        var stored: List<DavCollection> = davAccount.collections
+        val merged = store.updateCollections(account) { current ->
+            stored = current
+            CollectionDiscovery.merge(current, outcome.collections)
+        }
         // Only when the walk moved the Account's syncable set. Applying a selection reschedules
         // every authority — removePeriodicSync then addPeriodicSync — and rescheduling the authority
         // this run belongs to cancels this run, which the Collection loop then stops on at its first
         // check. There is nothing to apply on a day the server's list has not moved, so the run
         // keeps the sync it was woken for; on a day it has, the run that follows is the one that
         // syncs what this one selected. (A Collection discovered here arrives unselected, which on
-        // its own never changes the answer, so a new one costs no reschedule either.)
-        if (hasSyncableCollections(merged) != hasSyncableCollections(davAccount.collections)) {
+        // its own never changes the answer, so a new one costs no reschedule either.) The comparison
+        // is against the record the merge started from, for the same reason the merge is.
+        if (hasSyncableCollections(merged) != hasSyncableCollections(stored)) {
             SyncScheduler.applySelection(appContext, account, merged)
         }
         return merged

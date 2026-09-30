@@ -67,8 +67,26 @@ The engine makes the same statement where it cannot be argued away: an update of
 already holds never leaves without `If-Match`. A row whose ETag is null does not know the server's
 version, and there are only three things to do about it — send unconditionally, which is client-wins;
 hold the edit forever, which strands it; or ask. It asks, with the `PROPFIND Depth: 0` for `getetag`
-the session already had, and sends an ordinary conditional `PUT`. A server that names no ETag at all
-leaves `If-Match: *`, which says the one thing still known: the resource exists.
+the session already had. **Amended:** what the answer says decides more than the header. Every path
+that stores a text on a row stores the ETag the server named for it — the listing's, the multiget's,
+or this same `PROPFIND` after a `PUT` the server answered without one — so "dirty, named, no ETag" has
+exactly two producers: a revert whose restore has not landed, edited since; and a server that names no
+ETag at all. The `PROPFIND` tells them apart. A server that names one now would have named one when the
+text was stored, so the row's text is a version the server no longer holds — the one a `412` refused —
+and an ordinary conditional `PUT` patched out of it would carry that stale base back over the newer
+version under the ETag just asked for, with nothing to refuse it and nothing reported: the lost update
+this decision exists to prevent, arrived at through the machinery meant to repair a stall, the same
+shape the #35 amendment below describes with a stale base instead of none. So such a resource is not
+sent; it joins the restore's conflicted half, the server's copy replaces its rows, and the run reports
+it. Demonstrated on a device against Radicale, on a contact: with the `PUT` sent, a `PROPFIND` answered
+`"ddc7…"` and the `PUT If-Match: "ddc7…"` was accepted, replacing the other client's version with none
+reported; with the rule, the same `PROPFIND` ends step U for the resource and the multiget's copy lands
+on the row as a reported conflict, the server's ETag unmoved.
+Only a server that names no ETag at all leaves `If-Match: *`, which says the one thing still known: the
+resource exists — and on such a server the row's text can be nothing but the version the server holds.
+That server also makes the restore ask for every clean master on every run, since nothing the rows hold
+can tell its rows from a revert's; the cost is accepted for a server out of conformance with RFC 4791
+§2 rather than paid for with a second column on every conforming one.
 
 A revert now fetches what it gave back. Reverting was only ever half an answer: it stops the rows
 claiming to be current, and leaves the user's rejected text on them until the server's copy arrives.
@@ -235,8 +253,15 @@ left both alone, and the next run's `PUT` carried both components, the `RECURREN
   the digest of the photo it already holds, before anything it holds can be uploaded: a clean
   contact's rows are the server's, so that states a fact rather than assuming one. A dirty contact is
   skipped, because its photo may be the edit waiting to be sent, and claiming it matches the server
-  would drop that edit silently. Verified by upgrading a device from the previous release: the first
+  would drop that edit silently. What it holds instead is the old bookkeeping, and that proves one
+  thing: the previous release stored the photo row's `DATA_VERSION` and then moved it once by its own
+  write, so a row reading exactly `DATA_VERSION == SYNC2 + 1` has not been written by an editor since.
+  Such a row keeps the source's `PHOTO` and earns its digest from the upload's answer; any other
+  reading rebuilds the photo once, which is the one-time price of never claiming a baseline for a row
+  an editor may have touched. Verified by upgrading a device from the previous release: the first
   sync adopted the baseline, and a name-only edit afterwards left the server's `PHOTO` byte-identical.
+  The dirty-before-upgrade reading is by code and the previous release's own write path, not on a
+  device.
 - `CAN_PARTIALLY_UPDATE` stays 0 on every calendar this app creates. Turning it on would make the
   provider keep `LAST_SYNCED` copies that sync-adapter queries see, which `rowsClaiming` does not
   expect.

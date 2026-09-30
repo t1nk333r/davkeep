@@ -48,11 +48,13 @@ import app.davkeep.core.UploadBody
  *
  * Both directions are live. A write from the server replaces an item's rows wholesale, which is why a
  * fetched row is written `DIRTY=0`; a write from the phone is serialised by [patchContact] from the
- * item's own stored vCard, and `DIRTY` returns to 0 in exactly one place — [markUploaded], after the
- * server has answered the `PUT`. Nothing else may clear it: a row cleared without an answer is an
- * edit thrown away. The clear names the row it is about, matching on the `RawContacts.VERSION` the
- * body was read under, and commits in the same batch as the rows re-derived from that body: a
- * contact the user edited while the request was in flight keeps its flag and its newer rows.
+ * item's own stored vCard, and `DIRTY` returns to 0 only where the run has answered for the edit:
+ * [markUploaded] after the server accepted the `PUT`, [acknowledgeUnchanged] for a body the server
+ * already holds, and [revertLocalChange] and [replaceOverEdit] for an edit given up and reported.
+ * Nothing else may clear it: a row cleared without an answer is an edit thrown away. Each clear names
+ * the row it is about, matching on the `RawContacts.VERSION` the row was read under, and the answer
+ * to an upload commits in the same batch as the rows re-derived from the body: a contact the user
+ * edited while the request was in flight keeps its flag and its newer rows.
  *
  * @param photoFetcher used for `PHOTO;VALUE=uri`, and only for a URL that is on the Collection's own
  *   Origin. Left null, such photos are skipped and counted.
@@ -132,7 +134,23 @@ class ContactsMapper(
         collection: DavCollection,
         resources: Map<String, String>,
         etags: Map<String, String?>,
-    ): Int {
+    ): Set<String> = write(account, collection, resources, etags, givenUp = emptySet())
+
+    /**
+     * [upsert]'s work, with the one thing [replaceOverEdit] does differently: [givenUp] names the
+     * contacts whose pending edit the server's copy may be written over, and nothing else about the
+     * write changes — the same rows, the same batch, the same guard on `VERSION`, minus the guard on
+     * `DIRTY` for those keys alone.
+     *
+     * @return the keys whose rows now hold the server's copy.
+     */
+    private fun write(
+        account: Account,
+        collection: DavCollection,
+        resources: Map<String, String>,
+        etags: Map<String, String?>,
+        givenUp: Set<String>,
+    ): Set<String> {
         assertAccountRegistered(account)
 
         val contacts = ArrayList<Resource>()
@@ -168,7 +186,7 @@ class ContactsMapper(
             for (resource in contacts) {
                 val ref = appendContact(
                     account, collection, resource, etags[resource.key], dataUri, rawContactsUri, batch, stats, known,
-                    photoContacts,
+                    photoContacts, overEdit = resource.key in givenUp,
                 ) ?: continue
                 writtenContacts += resource to ref
                 resource.parsed.uid?.let { contactsByUid[it] = ref }
@@ -216,7 +234,10 @@ class ContactsMapper(
             }
 
             stats.items = contacts.size + groups.size
-            return Assembly(batch, photoContacts, unresolved, stats)
+            return Assembly(
+                batch, photoContacts, unresolved, stats,
+                written = writtenContacts.mapTo(LinkedHashSet()) { it.first.key } + writtenGroups.map { it.first.key },
+            )
         }
 
         // The rows this Collection already holds, for every name this batch asks about, read once for
@@ -231,7 +252,7 @@ class ContactsMapper(
         // empty batch is not something the framework accepts.
         if (assembly.batch.isEmpty()) {
             assembly.stats.log(collection)
-            return assembly.stats.items
+            return emptySet()
         }
 
         // Re-checked here and not only at the start: a long first sync is exactly when a user is
@@ -291,7 +312,7 @@ class ContactsMapper(
         }
 
         stats.log(collection)
-        return stats.items
+        return assembly.written
     }
 
     override fun deleteMissing(account: Account, collection: DavCollection, keepHrefs: Set<String>): Int {
@@ -692,10 +713,22 @@ class ContactsMapper(
     }
 
     /**
-     * Never reached: [restorePlan] names no contact conflicted, and the engine writes over an edit
-     * only for a key the plan named. A contact whose vCard this app never stored still serialises
-     * from its `Data` rows, so there is no edit here that cannot be sent — and discarding one that
-     * can be sent is the lost update this whole class is written around.
+     * Writes the server's copy over a contact whose edit has been given up.
+     *
+     * [restorePlan] names no contact conflicted of its own — a contact whose vCard this app never
+     * stored still serialises from its `Data` rows, so no edit here is unsendable for want of a
+     * base. What reaches this is the engine's other finding: a dirty contact with no ETag on a
+     * server that names one, whose stored vCard is therefore the version a `412` already said the
+     * server had moved past. Patching the edit onto that and sending it under the ETag just asked
+     * for would carry the stale card back over the newer one with nothing to refuse it, which is
+     * the lost update this whole class is written around. So the server's copy is written whole,
+     * through the same batch a listing's copy takes, minus the `DIRTY` guard for this key alone,
+     * and the run reports the conflict.
+     *
+     * A copy that does not parse resolves it the only other way: the row goes, with the edit, and
+     * the conflict is reported. The server still holds the card, and a body that becomes readable
+     * is fetched by the next listing that names it; left here the row would ask for the same body
+     * on every run and hold the edit out of every upload while doing so.
      */
     override fun replaceOverEdit(
         account: Account,
@@ -703,7 +736,53 @@ class ContactsMapper(
         key: String,
         text: String,
         etag: String?,
-    ): Boolean = false
+    ): Boolean {
+        val written = try {
+            write(account, collection, mapOf(key to text), mapOf(key to etag), givenUp = setOf(key))
+        } catch (e: OperationApplicationException) {
+            // The row moved under both attempts: nothing of either is on disk, and the next run
+            // meets the contact as it is then.
+            Log.i(LOG_TAG, "${collection.id}: $key moved while the server's copy was being written; nothing was written")
+            return false
+        }
+        if (key in written) return true
+        if (parseVCard(text) != null) return false
+        val deleted = resolver.delete(
+            RawContacts.CONTENT_URI.forSyncAdapter(account),
+            "${contactSelection()} AND ${RawContacts.SOURCE_ID}=?",
+            collectionArgs(account, collection) + key,
+        )
+        if (deleted > 0) {
+            Log.w(LOG_TAG, "${collection.id}: $key: the phone cannot hold the server's copy; the row and the edit on it are removed")
+        }
+        return deleted > 0
+    }
+
+    /**
+     * Removes a clean contact whose server copy the restore fetched and could not parse.
+     *
+     * The row is what a revert left — clean, named, no ETag, the phone's rejected card — and the
+     * server's version cannot land on it, so every run would ask for it again. It goes the way a
+     * listing gives no row to a card it cannot read; the server still holds it, and a body that
+     * becomes readable is fetched by the next listing that names it. The `DIRTY=0` in the selection
+     * is the whole guard: a contact is one row, so an edit made since the plan was read keeps it.
+     */
+    override fun discardUnwritable(account: Account, collection: DavCollection, key: String): Int {
+        assertAccountRegistered(account)
+        val deleted = deleteClean(account, collection, key)
+        if (deleted > 0) {
+            Log.w(LOG_TAG, "${collection.id}: $key: the phone cannot hold the server's copy; its row is removed")
+        }
+        return deleted
+    }
+
+    /** Deletes the contact stored under [key] if it holds no unsent change. */
+    private fun deleteClean(account: Account, collection: DavCollection, key: String): Int =
+        resolver.delete(
+            RawContacts.CONTENT_URI.forSyncAdapter(account),
+            "${contactSelection()} AND ${RawContacts.SOURCE_ID}=? AND ${RawContacts.DIRTY}=0",
+            collectionArgs(account, collection) + key,
+        )
 
     /**
      * The contact the server answered `404` for by name — the shape [deleteMissing] uses for a
@@ -717,11 +796,7 @@ class ContactsMapper(
      */
     override fun resourceGone(account: Account, collection: DavCollection, key: String): Int {
         assertAccountRegistered(account)
-        val deleted = resolver.delete(
-            RawContacts.CONTENT_URI.forSyncAdapter(account),
-            "${contactSelection()} AND ${RawContacts.SOURCE_ID}=? AND ${RawContacts.DIRTY}=0",
-            collectionArgs(account, collection) + key,
-        )
+        val deleted = deleteClean(account, collection, key)
         if (deleted > 0) {
             Log.i(LOG_TAG, "${collection.id}: $key is no longer on the server; its rows are removed")
         }
@@ -858,17 +933,34 @@ class ContactsMapper(
      * It is kept on the raw contact and not on the row it describes because [markUploaded] writes it
      * inside the batch guarded by `RawContacts.VERSION`: a sync-adapter update of a raw-contact column
      * moves no version, while a `Data` update moves the parent's, so a baseline stored on the photo
-     * row would invalidate the very guard it commits under. A row still carrying the old `Data.SYNC2`
-     * baseline reads as having none and is rebuilt once.
+     * row would invalidate the very guard it commits under.
+     *
+     * A row still carrying the old `Data.SYNC2` baseline and no new one is the one-time upgrade
+     * window: a contact synced before the digest existed and dirtied before the first run that would
+     * have adopted one — adoption skips a dirty contact, since its photo may be the edit. The old
+     * baseline was written as the row's `DATA_VERSION` and then bumped once by its own write, so an
+     * untouched row reads exactly `DATA_VERSION == SYNC2 + 1`, and every editor write to the row since
+     * moves it further. That is the one fact the old bookkeeping does prove, and it is read here for
+     * what it proves: the row's bytes are the ones the fetch or the last upload left, so the source's
+     * `PHOTO` is kept and [markUploaded] records the digest afterwards. Any other reading — no old
+     * baseline, a row moved since — rebuilds the photo, as before.
      */
     private fun photoEdit(account: Account, rowId: Long): PhotoEdit {
-        val present = resolver.query(
+        var present = false
+        var untouchedSinceOldBaseline = false
+        resolver.query(
             Data.CONTENT_URI.forSyncAdapter(account),
-            arrayOf(BaseColumns._ID),
+            arrayOf(Data.DATA_VERSION, Data.SYNC2),
             "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?",
             arrayOf(rowId.toString(), Photo.CONTENT_ITEM_TYPE),
             null,
-        )?.use { cursor -> cursor.moveToFirst() } ?: false
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                present = true
+                val old = cursor.getString(1)?.toLongOrNull()
+                untouchedSinceOldBaseline = old != null && cursor.getLong(0) == old + 1
+            }
+        }
         // No row at all: the photo is gone, and so is the source's property.
         if (!present) return PhotoEdit.Dropped
         val baseline = resolver.query(
@@ -878,6 +970,7 @@ class ContactsMapper(
             arrayOf(rowId.toString()),
             null,
         )?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        if (baseline == null && untouchedSinceOldBaseline) return PhotoEdit.Kept
         val bytes = displayPhotoBytes(account, rowId)
         if (bytes == null) {
             // A photo this app cannot spell is not a reason to delete one the user did not touch.
@@ -1095,12 +1188,18 @@ class ContactsMapper(
         known: KnownRows,
         /** Collects the contacts whose photo row this batch writes, for the baseline pass after it. */
         photoContacts: MutableList<RowRef>,
+        /**
+         * Whether an edit on the existing row has been given up, which only [replaceOverEdit] says.
+         * It lifts the hold on a dirty row and the `DIRTY=0` guard below; a tombstone is still
+         * refused, being a change the server has answered for.
+         */
+        overEdit: Boolean = false,
     ): RowRef? {
         val existing = known.contactIdsBySourceId[resource.key]
         // The phone's version of a row the user has edited or deleted since this listing was fetched is
         // the newer one, server or no server. The engine keeps such keys out of `wanted` for the same
         // reason; this is the second line, because the two can disagree in the seconds between.
-        if (existing != null && existing.pending) {
+        if (existing != null && (existing.deleted || (existing.dirty && !overEdit))) {
             stats.heldBack++
             Log.i(LOG_TAG, "${collection.id}/${resource.key}: has an edit waiting to be uploaded, not overwriting it")
             return null
@@ -1130,11 +1229,14 @@ class ContactsMapper(
             // The server's copy may only be written over the row the snapshot read: the delete and the
             // inserts below depend on this row being the one that was clean, and an expected-count
             // miss rolls all three back together. `DIRTY` and `DELETED` are matched as well as the
-            // version because a star the user toggled dirties a row without moving its version.
+            // version because a star the user toggled dirties a row without moving its version — the
+            // one caller that has given the edit up matches on the version alone, the flag being the
+            // very thing it is here to clear.
             batch += ContentProviderOperation.newUpdate(rawContactsUri)
                 .withSelection(
-                    "${RawContacts._ID}=? AND ${RawContacts.VERSION}=? AND ${RawContacts.DIRTY}=0 " +
-                        "AND ${RawContacts.DELETED}=0",
+                    "${RawContacts._ID}=? AND ${RawContacts.VERSION}=?" +
+                        (if (overEdit) "" else " AND ${RawContacts.DIRTY}=0") +
+                        " AND ${RawContacts.DELETED}=0",
                     arrayOf(existing.id.toString(), existing.version.toString()),
                 )
                 .withValues(sync)
@@ -1471,7 +1573,8 @@ class ContactsMapper(
                 name,
                 KnownContact(
                     cursor.getLong(0),
-                    pending = cursor.getLong(2) != 0L || cursor.getLong(3) != 0L,
+                    dirty = cursor.getLong(2) != 0L,
+                    deleted = cursor.getLong(3) != 0L,
                     version = cursor.getLong(4),
                 ),
             )
@@ -1516,10 +1619,12 @@ class ContactsMapper(
     )
 
     /**
-     * One contact row, whether the phone's version of it is one the server must not overwrite, and the
-     * provider's version counter, which is what a write over it matches on.
+     * One contact row, the two flags that make the phone's version of it one the server must not
+     * overwrite, and the provider's version counter, which is what a write over it matches on.
      */
-    private class KnownContact(val id: Long, val pending: Boolean, val version: Long)
+    private class KnownContact(val id: Long, val dirty: Boolean, val deleted: Boolean, val version: Long) {
+        val pending: Boolean get() = dirty || deleted
+    }
 
     private fun queryId(uri: Uri, selection: String, args: Array<String>): Long? =
         resolver.query(uri, arrayOf(BaseColumns._ID), selection, args, null)?.use { cursor ->
@@ -1668,6 +1773,8 @@ class ContactsMapper(
         val photoContacts: List<RowRef>,
         val unresolved: List<DeferredMembership>,
         val stats: UpsertStats,
+        /** The keys this attempt writes: every resource that parsed and was not held back. */
+        val written: Set<String>,
     )
 
     /** What one [upsert] did, in the numbers that make a sync readable in a log. */

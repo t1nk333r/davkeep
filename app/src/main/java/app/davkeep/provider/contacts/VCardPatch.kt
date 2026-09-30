@@ -47,9 +47,9 @@ internal class ContactBytes(val text: String, val uid: String?, val unchanged: B
 /**
  * What the contact's photo row says about `PHOTO`.
  *
- * "Unchanged" cannot be decided by comparing bytes: the provider re-encodes an image it is given, so
- * the row can never be equal to the source. It is decided by `Data.DATA_VERSION` against the `SYNC2`
- * snapshot the mapper takes when it writes the row (see `ContactsMapper`).
+ * "Unchanged" cannot be decided by comparing bytes against the source: the provider re-encodes an
+ * image it is given, so the row can never be equal to it. It is decided by a digest of the row's
+ * bytes against the one the mapper recorded when it last wrote or sent them (see `ContactsMapper`).
  */
 internal sealed interface PhotoEdit {
     /** The row changed since the source was written: the property is rebuilt from these bytes. */

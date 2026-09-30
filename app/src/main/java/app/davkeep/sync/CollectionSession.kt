@@ -277,6 +277,16 @@ internal class CollectionSession(
      * cannot name. It says only that the resource still exists, which is the one thing that is
      * known, and it is sent rather than nothing at all because an unconditional `PUT` of a resource
      * the server already has is the lost update the whole write path exists to prevent.
+     *
+     * A `404` to a conditional update is read as the precondition failing, which is what RFC 9110
+     * says of `If-Match` against a resource with no current representation and what Radicale and
+     * sabre answer `412` for. An origin that answers `404` instead — or a proxy in front of one —
+     * is saying the same thing by another number: the version this phone holds is not the one the
+     * server has, there being none. Left as an error it was neither retried nor resolved, and the
+     * row was counted pending and held out of every listing on every run for good; as a refusal it
+     * takes the conflict path, the restore asks for the resource by name, and the server's `404`
+     * there is the answer that removes the rows or makes them a create again. A create's `404` is
+     * still an error: it is about the Collection, not the resource.
      */
     suspend fun put(
         href: String,
@@ -310,6 +320,9 @@ internal class CollectionSession(
             }
         } catch (e: PreconditionFailedException) {
             // The answer, not a failure: the precondition the row's own state dictated did not hold.
+            PutAnswer.PreconditionFailed
+        } catch (e: NotFoundException) {
+            if (ifMatch == null && !ifMatchAny) throw e
             PutAnswer.PreconditionFailed
         }
         // [location] is deliberately not moved here. It is the Collection's own address, followed

@@ -60,10 +60,12 @@ private val ACCOUNT_ABORTING_CLASSES = setOf(
  *    there is no local database that could outlive the provider's account cleanup.
  *
  * And one about the direction this engine now runs in as well: a row is clean again only when the
- * server has answered for it. Step U sends every pending change before the listing, and
- * [ProviderMapper.markUploaded] is the one place a dirty flag is cleared; the read-only backstop
- * that used to clear it after every Collection is gone, because once uploads exist every DIRTY row
- * is a row an editor has changed and no run has sent yet.
+ * run has answered for it. Step U sends every pending change before the listing, and a dirty flag
+ * is cleared by [ProviderMapper.markUploaded] after the server accepted the body, by
+ * [ProviderMapper.acknowledgeUnchanged] for a body the server already holds, or by a revert or a
+ * conflict the run reports; the read-only backstop that used to clear it after every Collection is
+ * gone, because once uploads exist every DIRTY row is a row an editor has changed and no run has
+ * sent yet.
  *
  * A run the framework starts with `SYNC_EXTRAS_UPLOAD` is upload-only: step U for every writable
  * Collection and nothing else — no listing, no deletion, no state write. It still fetches what a
@@ -304,7 +306,10 @@ class SyncEngine(
             // edit is on them, and step U held every one of them for want of a base to patch. That
             // edit can never be sent, and the rows were never written from the server's text, so
             // the server's copy replaces them and the run reports a conflict — the same answer a
-            // `412` gets, arrived at without one.
+            // `412` gets, arrived at without one. Step U adds the resources it found stale by
+            // asking: dirty rows with a text but no ETag, for which the server names one. Their
+            // text was stored under no version the server now holds, and a body patched out of
+            // it would have carried that stale base back under the ETag just asked for.
             //
             // When step U has already ended the Collection on an error, the restore is still tried —
             // the rows were given back either way — but its own failure must not replace the error the
@@ -312,18 +317,19 @@ class SyncEngine(
             // REPORT would send the user after the wrong problem.
             val plan = mapper.restorePlan(account, collection)
             val owed = plan.full - uploads.held
+            val conflicted = plan.conflicted + uploads.stale
             val failure = uploads.error
             val restore = if (failure == null) {
-                restoreReverted(account, collection, session, owed, plan.conflicted)
+                restoreReverted(account, collection, session, owed, conflicted)
             } else {
                 try {
-                    restoreReverted(account, collection, session, owed, plan.conflicted)
+                    restoreReverted(account, collection, session, owed, conflicted)
                 } catch (e: AccountVanishedException) {
                     throw e
                 } catch (e: Exception) {
                     // Not reported on its own: the run already reports step U's error, and every
                     // resource this failed to fetch is counted as missing in the outcome below.
-                    Restore(unanswered = owed + plan.conflicted)
+                    Restore(unanswered = owed + conflicted)
                 }
             }
 
@@ -486,7 +492,10 @@ class SyncEngine(
             if (bodies.isEmpty()) continue
 
             val etags = batch.associate { it.key to it.value.etag }.filterKeys { it in bodies }
-            written += mapper.upsert(account, collection, bodies.mapValues { it.value.text }, etags)
+            written += mapper.upsert(account, collection, bodies.mapValues { it.value.text }, etags).size
+            // A body that arrived and could not be written is still answered: the server handed it
+            // over, and withholding the state for a resource the provider cannot hold would list
+            // the Collection in full on every run for as long as that body stays unreadable.
             fetched += bodies.keys
         }
 
@@ -592,21 +601,35 @@ class SyncEngine(
      * create the server answered `412` is reverted under the name it was `PUT` to, and that name
      * arrives with no text behind it; until the restore brings one there is nothing for an edit to
      * be patched onto, so the row's own upload is held on every run — and the row, being dirty, has
-     * dropped out of [keys] and is asked about by nothing.
+     * dropped out of [keys] and is asked about by nothing. A revert of an update leaves its text
+     * behind, and an edit on top of that is the same debt in a worse shape: the text is the version
+     * a `412` already said the server had moved past, and step U, finding no ETag on the row and
+     * one on the server, sends it here rather than patching onto it.
      *
-     * It is asked about here, and resolved as a conflict: the server's copy replaces the rows and
-     * the run reports it, exactly as a `412` would be reported. Keeping the edit was tried and is
-     * wrong — those rows were never written from the server's text, so a body patched out of them
-     * would carry every column the server had changed meanwhile back to what the phone happens to
-     * hold, under an ETag this phone got by fetching, with no `412` to stop it and nothing said.
-     * Proving the fetched text is this phone's own lost create would need the sent bytes kept on
-     * the row and compared, which is new state for a comparison any normalising server makes
-     * meaningless; and the edit this gives up is one that could never have been sent at all.
+     * Both are asked about here, and resolved as a conflict: the server's copy replaces the rows
+     * and the run reports it, exactly as a `412` would be reported. Keeping the edit was tried and
+     * is wrong — those rows hold no text the server's current version was ever read from, so a body
+     * patched out of them would carry every column the server had changed meanwhile back to what
+     * the phone happens to hold, under an ETag this phone got by asking, with no `412` to stop it
+     * and nothing said. Proving the stored text is this phone's own lost create, or the version the
+     * server still holds, would need the sent bytes kept on the row and compared, which is new state
+     * for a comparison any normalising server makes meaningless; and the edit this gives up is one
+     * that could never have been sent at all.
      *
      * The ETag stored is the one the multiget's own response named, because there is no listing here
      * to read one from and a row whose text has no ETag is fetched again by the next listing that
-     * names it. A server that names none in a multiget is asked once, per resource, with the same
-     * `PROPFIND Depth: 0` an ETag-less `PUT` answer uses.
+     * names it. A server that names none in a multiget is asked with the same `PROPFIND Depth: 0`
+     * an ETag-less `PUT` answer uses — once per restore rather than once per resource: a server
+     * that has no ETag for one member it just handed over has none for any, so the first null
+     * answer stands for the rest, and a Collection on such a server costs one extra request here
+     * rather than one per member.
+     *
+     * A body that arrived and could not be written is not an answer. The rows still hold what the
+     * revert left, and asking again next run would get the same body: so a resource of [keys] whose
+     * copy the provider cannot hold gives its rows up through [ProviderMapper.discardUnwritable],
+     * the way a listing gives no rows to a resource it cannot read, and one of [conflicted] does
+     * the same inside [ProviderMapper.replaceOverEdit] and is reported. What neither could touch —
+     * rows that moved under the call — is counted in [Restore.unanswered] and met again next run.
      *
      * A `404` for an href is the server deciding, by name, that it no longer has the resource:
      * [ProviderMapper.resourceGone] removes its clean rows, and rows holding an edit give the name
@@ -631,6 +654,14 @@ class SyncEngine(
         var deleted = 0
         val conflicts = ArrayList<String>()
         val answered = HashSet<String>(wanted.size)
+        // Whether the server has an ETag to name at all, learned from the first member it named
+        // none for in a multiget. Null until a body arrives without one.
+        var namesEtags: Boolean? = null
+        suspend fun etagFor(key: String, body: FetchedBody): String? {
+            body.etag?.let { return it }
+            if (namesEtags == false) return null
+            return session.etagOf(key).also { namesEtags = it != null }
+        }
         for (batch in wanted.chunked(MULTIGET_BATCH_SIZE)) {
             ensureAccountRegistered(account)
 
@@ -640,19 +671,32 @@ class SyncEngine(
             // hold an edit gives that edit up and has to be reported.
             val whole = fetched.bodies.filterKeys { it in keys }
             if (whole.isNotEmpty()) {
-                val etags = whole.mapValues { (key, body) -> body.etag ?: session.etagOf(key) }
-                written += mapper.upsert(account, collection, whole.mapValues { it.value.text }, etags)
+                val etags = whole.mapValues { (key, body) -> etagFor(key, body) }
+                val stored = mapper.upsert(account, collection, whole.mapValues { it.value.text }, etags)
+                written += stored.size
+                answered += stored
+                for (key in whole.keys) {
+                    if (key in stored) continue
+                    // The server's copy cannot land on these rows, and nothing later in the run
+                    // will do better with the same body. Rows an edit reached since the plan was
+                    // read stay whole and unanswered: that edit is step U's next run.
+                    val removed = mapper.discardUnwritable(account, collection, key)
+                    if (removed > 0) {
+                        deleted += removed
+                        answered += key
+                    }
+                }
             }
             for ((key, body) in fetched.bodies) {
                 if (key !in conflicted) continue
-                val replaced = mapper.replaceOverEdit(
-                    account, collection, key, body.text, body.etag ?: session.etagOf(key),
-                )
+                val replaced = mapper.replaceOverEdit(account, collection, key, body.text, etagFor(key, body))
                 // One resource at a time, so that what is reported as resolved is what was written:
                 // a resource whose rows moved under the call keeps them and is met again next run.
-                if (replaced) conflicts += key
+                if (replaced) {
+                    conflicts += key
+                    answered += key
+                }
             }
-            answered += fetched.bodies.keys
             for (key in fetched.gone) {
                 // The server has decided: it no longer has the resource, by name. Counting it
                 // missing instead would never converge, because nothing will ever name it again.
@@ -731,6 +775,7 @@ class SyncEngine(
         var pending = 0
         val conflicts = mutableListOf<String>()
         val held = mutableSetOf<String>()
+        val stale = mutableSetOf<String>()
 
         for ((index, change) in changes.withIndex()) {
             ensureAccountRegistered(account)
@@ -814,11 +859,36 @@ class SyncEngine(
                         // which version the server has, and a `PUT` without `If-Match` would take
                         // whatever is there — the lost update `server wins` exists to prevent, and
                         // the shape a partial revert after a 412 used to leave behind. One
-                        // `PROPFIND Depth: 0` is what the phone does not know, so it is asked for,
-                        // and the `PUT` that follows is an ordinary conditional one. Holding the
-                        // change back instead would stand the edit still forever on a server whose
-                        // ETag this phone has never managed to store.
-                        val ifMatch = if (creating) null else change.etag ?: session.etagOf(target)
+                        // `PROPFIND Depth: 0` is what the phone does not know, so it is asked for.
+                        //
+                        // What the answer says decides more than the header. Every path that stores
+                        // a text on a row stores the ETag the server named for it — the listing's,
+                        // the multiget's, or this same PROPFIND after a `PUT` the server answered
+                        // without one — so a row that has a text and no ETag, on a server that
+                        // names one now, holds a text the server's current version was never read
+                        // from: a revert left it there, a `412` having said the server had moved,
+                        // and the restore that was to replace it has not landed. Patching the edit
+                        // onto it and sending the result under the ETag just asked for would put
+                        // the stale base back over the version the `412` was about, with nothing
+                        // to refuse it and nothing reported — the lost update the revert exists to
+                        // prevent, through the machinery meant to repair it. So it is not sent: the
+                        // resource goes to the restore's conflicted half, where the server's copy
+                        // replaces the rows and the run reports it, as it reports every conflict.
+                        //
+                        // Only a server that names no ETag at all leaves the `PUT` to go, under
+                        // `If-Match: *`: such a row's text can be nothing but the version the
+                        // server holds, there being no other version for it to have named, and
+                        // holding the edit back would stand it still forever.
+                        var ifMatch = change.etag
+                        if (!creating && ifMatch == null) {
+                            ifMatch = session.etagOf(target)
+                            if (ifMatch != null) {
+                                pending++
+                                held += target
+                                stale += target
+                                continue
+                            }
+                        }
 
                         val action = answerOf(
                             session.put(
@@ -918,6 +988,7 @@ class SyncEngine(
                         pending = pending + (changes.size - index),
                         conflicts = conflicts,
                         held = held,
+                        stale = stale,
                         error = error,
                     )
 
@@ -933,6 +1004,7 @@ class SyncEngine(
             pending = pending,
             conflicts = conflicts,
             held = held,
+            stale = stale,
         )
     }
 
@@ -1125,6 +1197,12 @@ private class Uploads(
     val conflicts: List<String> = emptyList(),
     /** Keys whose rows are still dirty, which the fetch of this run must leave alone. */
     val held: Set<String> = emptySet(),
+    /**
+     * Of [held], the keys step U would have `PUT` from a text stored under no version the server
+     * now names: the server has an ETag for them and the row has none. They are counted pending
+     * here and go to the restore's conflicted half, which un-counts the ones it resolved.
+     */
+    val stale: Set<String> = emptySet(),
     /** The failure that ended step U, when one did. */
     val error: SyncError? = null,
 ) {

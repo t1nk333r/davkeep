@@ -307,13 +307,18 @@ interface ProviderMapper {
      *
      * The two must be persisted together: an ETag stored without its body (or vice versa) would
      * make the next run's diff against [localItems] lie about what is already present.
+     *
+     * Returns the hrefs whose rows now hold the server's copy. A body that is left out of the
+     * answer was not written: it did not parse, it describes nothing the provider can hold, or
+     * its rows hold an edit that arrived since they were last read. The caller can tell the
+     * three apart only by what it does next, which is why they are not distinguished here.
      */
     fun upsert(
         account: Account,
         collection: DavCollection,
         resources: Map<String, String>,
         etags: Map<String, String?>,
-    ): Int
+    ): Set<String>
 
     /** Only ever called with a listing that completed. */
     fun deleteMissing(account: Account, collection: DavCollection, keepHrefs: Set<String>): Int
@@ -342,8 +347,13 @@ interface ProviderMapper {
      * Stores identity, ETag and `DIRTY=0` in one operation, after the server answered 2xx.
      *
      * Returns false when the row moved since [change] was read: the edit that arrived during the
-     * request is still pending, so the row stays dirty and the next run sends it. This is the one
-     * place a dirty flag may be cleared — a row cleared without an answer is an edit thrown away.
+     * request is still pending, so the row stays dirty and the next run sends it. A dirty flag is
+     * cleared here, by the answer to the row's own upload, and in three other places that each
+     * account for the edit they clear: [acknowledgeUnchanged], for a body the server already holds;
+     * [revertLocalChange], for an edit the server refused or a Collection would not take, which the
+     * run reports; and [replaceOverEdit], for an edit that can never be sent, which the run reports
+     * as a conflict. Nothing clears one as a backstop — a row cleared without one of those answers
+     * is an edit thrown away.
      */
     fun markUploaded(
         account: Account,
@@ -391,7 +401,10 @@ interface ProviderMapper {
      * patch it onto — so it can never be sent, and nothing the rows say can be trusted to describe
      * what the server holds. Those resources are fetched and resolved the way a `412` is resolved:
      * the server's copy replaces the rows, through [replaceOverEdit], and the run reports a
-     * conflict.
+     * conflict. The engine adds to that half the resource whose rows do hold a text but no ETag
+     * while the server names one for it: that text was stored under no version the server now
+     * holds, so a body patched out of it would carry a stale base back, and it is resolved the
+     * same way.
      */
     fun restorePlan(account: Account, collection: DavCollection): RestorePlan
 
@@ -400,12 +413,20 @@ interface ProviderMapper {
      * conflict resolution for a resource whose edit can never be sent.
      *
      * This is the one write that discards a local change without an answer from the server about
-     * that change, and it is legitimate for one reason only — the rows were never populated from
-     * the server's text, so the difference between them and [text] is not an edit anyone can
-     * describe, and the resource is [RestorePlan.conflicted]. Called with nothing else.
+     * that change, and it is legitimate for one reason only — the rows hold no text the server's
+     * current version was ever read from, so the difference between them and [text] is not an edit
+     * anyone can describe, and the resource is [RestorePlan.conflicted] or one the engine found
+     * stale by asking. Called with nothing else.
      *
-     * Returns whether the rows were replaced; false leaves them exactly as they were, which is
-     * what a resource whose master became a tombstone under this call gets.
+     * A [text] the provider cannot hold — one that does not parse, or describes no row — still
+     * resolves the conflict: the rows are removed, because the server's version is what belongs
+     * there and the phone has no way to show it, exactly as a listing gives such a resource no
+     * rows. Leaving them would ask for the same body on every run for good and hold the edit out
+     * of every upload while doing so.
+     *
+     * Returns whether the rows now show the server's answer; false leaves them exactly as they
+     * were, which is what a resource whose master became a tombstone, or whose rows moved under
+     * this call, gets.
      */
     fun replaceOverEdit(
         account: Account,
@@ -414,6 +435,21 @@ interface ProviderMapper {
         text: String,
         etag: String?,
     ): Boolean
+
+    /**
+     * The server's copy of [key] arrived for rows a revert left, and [upsert] could not write it:
+     * it did not parse, or it describes nothing the provider can hold.
+     *
+     * The rows are the phone's rejected text, waiting for a version that cannot land on them, and
+     * every run would ask for it again. So they go, the way a listing gives no rows to a resource
+     * it cannot read — the server still holds it, and a body that becomes readable is fetched by
+     * the next listing that names it. Only rows holding no unsent change are removed, decided in
+     * the same transaction as the delete: an edit made since the plan was read is newer than this
+     * answer and keeps every row of the resource, for step U to meet next run.
+     *
+     * Returns the rows removed; zero means the resource holds an edit and nothing was written.
+     */
+    fun discardUnwritable(account: Account, collection: DavCollection, key: String): Int
 
     /**
      * The server has said, by name, that it no longer has the resource stored under [key].
