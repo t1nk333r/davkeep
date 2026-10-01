@@ -20,6 +20,24 @@ The reason is the phone. Several builds a day land on a real device, and a versi
 does not move makes "which build is this?" unanswerable from the device itself. The app
 shows its own version at the bottom of the settings screen for exactly that check.
 
+## Releasing
+
+A release goes to two places from the same signed APK: the GitHub release, which
+Obtainium follows, and the owner's Feather store, an F-Droid repository signed with
+the release key. The store's address, an API token and its MCP server
+(`feather_mcp.py`) live in `~/.config/feather/` on the release machine.
+
+- Publish with `publish_app`, and always pass `whats_new` with the contents of
+  `fastlane/metadata/android/en-US/changelogs/<versionCode>.txt`. A version's notes
+  are set when it is published and cannot be added later, because the store never
+  replaces a version.
+- Read the `warnings` in the result. A debuggable APK is published anyway, only with
+  a warning.
+- After the index rebuild, `repo_status` must show the new version and an empty
+  `rejected` list.
+- App details (summary, licence, links) change through `update_app`, not through a
+  publish. A publish only sets them when it creates the app.
+
 ## Agent skills
 
 ### Issue tracker
